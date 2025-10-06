@@ -13,7 +13,7 @@ To keep Logstash working we rewrote the output plugin so that it does not depend
 
 ## Installation
 ```
-bin/logstash-plugin install logstash-output-azureblob-rest
+bin/logstash-plugin install https://github.com/paoloamato/logstash-output-azureblob-rest/releases/download/0.10.0/logstash-output-azureblob-rest-0.10.0.gem
 ```
 (Replace the gem name with the exact version or package URL if you host it privately.)
 

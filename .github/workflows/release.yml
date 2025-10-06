@@ -1,0 +1,42 @@
+name: Build gem on release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-attach:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+
+      - name: Build gem
+        run: |
+          gem build logstash-output-azureblob-rest.gemspec
+          ls -lh *.gem
+
+      - name: Determine gem file
+        id: gem
+        run: |
+          FILE=$(ls logstash-output-azureblob-rest-*.gem)
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "basename=$(basename "$FILE")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ${{ steps.gem.outputs.file }}
+          asset_name: ${{ steps.gem.outputs.basename }}
+          asset_content_type: application/octet-stream
