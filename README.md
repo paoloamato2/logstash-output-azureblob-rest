@@ -45,8 +45,5 @@ bundle exec rspec
 bundle exec gem build logstash-output-azureblob-rest.gemspec
 ```
 
-## Additional documentation
-- [`docs/architecture.md`](docs/architecture.md) – full investigation log and rationale for the rewrite.
-
 ## License
 Apache 2.0
