@@ -43,6 +43,14 @@ output {
 - HTTP 5xx / 429 / 408 responses and transient connection errors are retried a few times with backoff.
 - Non-retriable errors (for example 403 authorization failures) are logged and the batch is dropped, but the pipeline worker keeps running.
 
+## Reliability tuning (optional)
+- `retry_max_attempts` (default: 3)
+- `retry_delay_seconds` (default: 2) with per-attempt linear backoff
+- `retry_max_delay_seconds` (default: 0 = uncapped)
+- `http_open_timeout_seconds` (default: 10)
+- `http_read_timeout_seconds` (default: 60)
+- `log_response_bytes` (default: 2048) to cap how much of the error body is logged
+
 ## Development
 ```
 bundle install

@@ -14,6 +14,12 @@ class LogStash::Outputs::LogstashAzureBlobOutput < LogStash::Outputs::Base
   config_name 'azure_blob'
   default :codec, 'line'
 
+  DEFAULT_MAX_RETRIES = 3
+  DEFAULT_RETRY_DELAY_SECONDS = 2
+  DEFAULT_OPEN_TIMEOUT_SECONDS = 10
+  DEFAULT_READ_TIMEOUT_SECONDS = 60
+  DEFAULT_LOG_RESPONSE_BYTES = 2048
+
   config :storage_account_name, validate: :string, required: true
   config :storage_access_key, validate: :string, required: true
   config :container_name, validate: :string, required: true
@@ -23,10 +29,34 @@ class LogStash::Outputs::LogstashAzureBlobOutput < LogStash::Outputs::Base
   config :compress, validate: :boolean, default: false
   config :events_per_blob, validate: :number, default: 0
   config :content_type, validate: :string, default: 'text/plain; charset=utf-8'
+  config :retry_max_attempts, validate: :number, default: DEFAULT_MAX_RETRIES
+  config :retry_delay_seconds, validate: :number, default: DEFAULT_RETRY_DELAY_SECONDS
+  config :retry_max_delay_seconds, validate: :number, default: 0 # 0 means uncapped
+  config :http_open_timeout_seconds, validate: :number, default: DEFAULT_OPEN_TIMEOUT_SECONDS
+  config :http_read_timeout_seconds, validate: :number, default: DEFAULT_READ_TIMEOUT_SECONDS
+  config :log_response_bytes, validate: :number, default: DEFAULT_LOG_RESPONSE_BYTES
 
   def register
+    @max_response_log_bytes = normalise_non_negative_int(@log_response_bytes, DEFAULT_LOG_RESPONSE_BYTES)
+
+    max_retries = normalise_non_negative_int(@retry_max_attempts, DEFAULT_MAX_RETRIES)
+    retry_delay_seconds = normalise_non_negative_float(@retry_delay_seconds, DEFAULT_RETRY_DELAY_SECONDS)
+    retry_max_delay_seconds = normalise_non_negative_float(@retry_max_delay_seconds, 0)
+    retry_max_delay_seconds = nil if retry_max_delay_seconds <= 0
+    open_timeout = normalise_non_negative_float(@http_open_timeout_seconds, DEFAULT_OPEN_TIMEOUT_SECONDS)
+    read_timeout = normalise_non_negative_float(@http_read_timeout_seconds, DEFAULT_READ_TIMEOUT_SECONDS)
+
     @logger.info('Azure blob output: initialising client', account: storage_account_name, container: container_name)
-    @blob_client = SharedKeyClient.new(storage_account_name, storage_access_key, @logger)
+    @blob_client = SharedKeyClient.new(
+      storage_account_name,
+      storage_access_key,
+      @logger,
+      max_retries: max_retries,
+      retry_delay_seconds: retry_delay_seconds,
+      retry_max_delay_seconds: retry_max_delay_seconds,
+      open_timeout: open_timeout,
+      read_timeout: read_timeout
+    )
     begin
       @blob_client.ensure_container(container_name)
     rescue SharedKeyClient::RequestError => e
@@ -143,24 +173,34 @@ class LogStash::Outputs::LogstashAzureBlobOutput < LogStash::Outputs::Base
     value
   end
 
-  MAX_RESPONSE_LOG_BYTES = 2048
+  def normalise_non_negative_int(value, default_value)
+    return default_value if value.nil?
+    v = value.to_i
+    v >= 0 ? v : default_value
+  rescue StandardError
+    default_value
+  end
+
+  def normalise_non_negative_float(value, default_value)
+    return default_value if value.nil?
+    v = value.to_f
+    v >= 0 ? v : default_value
+  rescue StandardError
+    default_value
+  end
 
   def truncate_body(body)
     return nil if body.nil?
-    return body if body.bytesize <= MAX_RESPONSE_LOG_BYTES
+    return body if body.bytesize <= @max_response_log_bytes
 
-    body.byteslice(0, MAX_RESPONSE_LOG_BYTES) + '... [truncated]'
+    body.byteslice(0, @max_response_log_bytes) + '... [truncated]'
   rescue StandardError
-    body.to_s[0, MAX_RESPONSE_LOG_BYTES]
+    body.to_s[0, @max_response_log_bytes]
   end
 
   class SharedKeyClient
     API_VERSION = '2020-10-02'.freeze
     RETRYABLE_STATUS = ([408, 429] + (500..599).to_a).freeze
-    MAX_RETRIES = 3
-    RETRY_DELAY_SECONDS = 2
-    OPEN_TIMEOUT = 10
-    READ_TIMEOUT = 60
 
     class RequestError < StandardError
       attr_reader :status, :body, :request_id
@@ -173,10 +213,16 @@ class LogStash::Outputs::LogstashAzureBlobOutput < LogStash::Outputs::Base
       end
     end
 
-    def initialize(account, access_key, logger)
+    def initialize(account, access_key, logger, options = {})
       @account = account
       @key = Base64.decode64(access_key)
       @logger = logger
+      @max_retries = normalise_non_negative_int(options[:max_retries], DEFAULT_MAX_RETRIES)
+      @retry_delay_seconds = normalise_non_negative_float(options[:retry_delay_seconds], DEFAULT_RETRY_DELAY_SECONDS)
+      @retry_max_delay_seconds = normalise_non_negative_float(options[:retry_max_delay_seconds], 0)
+      @retry_max_delay_seconds = nil if @retry_max_delay_seconds <= 0
+      @open_timeout = normalise_non_negative_float(options[:open_timeout], DEFAULT_OPEN_TIMEOUT_SECONDS)
+      @read_timeout = normalise_non_negative_float(options[:read_timeout], DEFAULT_READ_TIMEOUT_SECONDS)
     end
 
     def ensure_container(container)
@@ -217,7 +263,7 @@ class LogStash::Outputs::LogstashAzureBlobOutput < LogStash::Outputs::Base
 
       begin
         attempts += 1
-        Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: OPEN_TIMEOUT, read_timeout: READ_TIMEOUT) do |http|
+        Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: @open_timeout, read_timeout: @read_timeout) do |http|
           response = http.request(request)
           status = response.code.to_i
           return response if acceptable.include?(status)
@@ -230,7 +276,7 @@ class LogStash::Outputs::LogstashAzureBlobOutput < LogStash::Outputs::Base
           )
         end
       rescue RequestError => e
-        if retryable_status?(e.status) && attempts <= MAX_RETRIES
+        if retryable_status?(e.status) && attempts <= @max_retries
           delay = retry_delay(attempts)
           @logger.warn('Azure blob output: retrying after HTTP failure', status: e.status, request_id: e.request_id, attempt: attempts, delay: delay)
           sleep(delay)
@@ -238,7 +284,7 @@ class LogStash::Outputs::LogstashAzureBlobOutput < LogStash::Outputs::Base
         end
         raise
       rescue Net::OpenTimeout, Net::ReadTimeout, Errno::ECONNRESET => e
-        if attempts <= MAX_RETRIES
+        if attempts <= @max_retries
           delay = retry_delay(attempts)
           @logger.warn('Azure blob output: retrying after connection failure', error: e.message, attempt: attempts, delay: delay)
           sleep(delay)
@@ -295,7 +341,26 @@ class LogStash::Outputs::LogstashAzureBlobOutput < LogStash::Outputs::Base
     end
 
     def retry_delay(attempt)
-      RETRY_DELAY_SECONDS * attempt
+      delay = @retry_delay_seconds * attempt
+      return delay if @retry_max_delay_seconds.nil?
+
+      [delay, @retry_max_delay_seconds].min
+    end
+
+    def normalise_non_negative_int(value, default_value)
+      return default_value if value.nil?
+      v = value.to_i
+      v >= 0 ? v : default_value
+    rescue StandardError
+      default_value
+    end
+
+    def normalise_non_negative_float(value, default_value)
+      return default_value if value.nil?
+      v = value.to_f
+      v >= 0 ? v : default_value
+    rescue StandardError
+      default_value
     end
   end
 end
