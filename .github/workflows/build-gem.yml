@@ -1,0 +1,41 @@
+name: Build gem (non-release)
+
+on:
+  workflow_dispatch:
+  push:
+    branches-ignore:
+      - master
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+
+      - name: Build gem
+        run: |
+          gem build logstash-output-azureblob-rest.gemspec
+          ls -lh *.gem
+
+      - name: Determine gem file
+        id: gem
+        run: |
+          FILE=$(ls logstash-output-azureblob-rest-*.gem)
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "basename=$(basename "$FILE")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.gem.outputs.basename }}
+          path: ${{ steps.gem.outputs.file }}
