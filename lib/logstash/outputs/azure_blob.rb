@@ -27,7 +27,25 @@ class LogStash::Outputs::LogstashAzureBlobOutput < LogStash::Outputs::Base
   def register
     @logger.info('Azure blob output: initialising client', account: storage_account_name, container: container_name)
     @blob_client = SharedKeyClient.new(storage_account_name, storage_access_key, @logger)
-    @blob_client.ensure_container(container_name)
+    begin
+      @blob_client.ensure_container(container_name)
+    rescue SharedKeyClient::RequestError => e
+      @logger.error(
+        'Azure blob output: failed to ensure container, continuing',
+        container: container_name,
+        status: e.status,
+        request_id: e.request_id,
+        response_body: truncate_body(e.body)
+      )
+    rescue => e
+      @logger.error(
+        'Azure blob output: unexpected error during container ensure, continuing',
+        container: container_name,
+        error: e.message,
+        class: e.class.name,
+        backtrace: e.backtrace&.take(10)
+      )
+    end
 
     @sanitised_prefix = sanitise_path(@prefix)
     @file_extension = normalise_extension(@file_extension)
