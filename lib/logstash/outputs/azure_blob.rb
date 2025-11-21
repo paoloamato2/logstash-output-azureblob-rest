@@ -37,19 +37,37 @@ class LogStash::Outputs::LogstashAzureBlobOutput < LogStash::Outputs::Base
     return if events_and_encoded.empty?
 
     split_batches(events_and_encoded).each do |batch|
-      event = batch.first.first
-      blob_name = build_blob_name(event)
-      payload = serialise_payload(batch)
-
-      @blob_client.upload_block_blob(@container_name, blob_name, payload, content_type: resolved_content_type)
-      @logger.info('Azure blob output: uploaded blob', blob: blob_name, bytes: payload.bytesize)
+      upload_batch(batch)
     end
-  rescue => e
-    @logger.error('Azure blob output failed', error: e.message, class: e.class.name, backtrace: e.backtrace&.take(10))
-    raise
   end
 
   private
+
+  def upload_batch(batch)
+    blob_name = nil
+    event = batch.first.first
+    blob_name = build_blob_name(event)
+    payload = serialise_payload(batch)
+
+    @blob_client.upload_block_blob(@container_name, blob_name, payload, content_type: resolved_content_type)
+    @logger.info('Azure blob output: uploaded blob', blob: blob_name, bytes: payload.bytesize)
+  rescue SharedKeyClient::RequestError => e
+    @logger.error(
+      'Azure blob output: request failed, dropping batch',
+      blob: blob_name,
+      status: e.status,
+      request_id: e.request_id,
+      response_body: truncate_body(e.body)
+    )
+  rescue => e
+    @logger.error(
+      'Azure blob output: unexpected failure, dropping batch',
+      blob: blob_name,
+      error: e.message,
+      class: e.class.name,
+      backtrace: e.backtrace&.take(10)
+    )
+  end
 
   def resolved_content_type
     return 'application/octet-stream' if @compress
@@ -107,8 +125,35 @@ class LogStash::Outputs::LogstashAzureBlobOutput < LogStash::Outputs::Base
     value
   end
 
+  MAX_RESPONSE_LOG_BYTES = 2048
+
+  def truncate_body(body)
+    return nil if body.nil?
+    return body if body.bytesize <= MAX_RESPONSE_LOG_BYTES
+
+    body.byteslice(0, MAX_RESPONSE_LOG_BYTES) + '... [truncated]'
+  rescue StandardError
+    body.to_s[0, MAX_RESPONSE_LOG_BYTES]
+  end
+
   class SharedKeyClient
     API_VERSION = '2020-10-02'.freeze
+    RETRYABLE_STATUS = ([408, 429] + (500..599).to_a).freeze
+    MAX_RETRIES = 3
+    RETRY_DELAY_SECONDS = 2
+    OPEN_TIMEOUT = 10
+    READ_TIMEOUT = 60
+
+    class RequestError < StandardError
+      attr_reader :status, :body, :request_id
+
+      def initialize(message, status:, body:, request_id: nil)
+        super(message)
+        @status = status
+        @body = body
+        @request_id = request_id
+      end
+    end
 
     def initialize(account, access_key, logger)
       @account = account
@@ -150,12 +195,38 @@ class LogStash::Outputs::LogstashAzureBlobOutput < LogStash::Outputs::Base
     end
 
     def send_request(uri, request, acceptable: [200])
-      Net::HTTP.start(uri.host, uri.port, use_ssl: true) do |http|
-        response = http.request(request)
-        status = response.code.to_i
-        return response if acceptable.include?(status)
+      attempts = 0
 
-        raise "Azure request failed: #{status} - #{response.body}" 
+      begin
+        attempts += 1
+        Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: OPEN_TIMEOUT, read_timeout: READ_TIMEOUT) do |http|
+          response = http.request(request)
+          status = response.code.to_i
+          return response if acceptable.include?(status)
+
+          raise RequestError.new(
+            "Azure request failed: #{status}",
+            status: status,
+            body: response.body,
+            request_id: response['x-ms-request-id']
+          )
+        end
+      rescue RequestError => e
+        if retryable_status?(e.status) && attempts <= MAX_RETRIES
+          delay = retry_delay(attempts)
+          @logger.warn('Azure blob output: retrying after HTTP failure', status: e.status, request_id: e.request_id, attempt: attempts, delay: delay)
+          sleep(delay)
+          retry
+        end
+        raise
+      rescue Net::OpenTimeout, Net::ReadTimeout, Errno::ECONNRESET => e
+        if attempts <= MAX_RETRIES
+          delay = retry_delay(attempts)
+          @logger.warn('Azure blob output: retrying after connection failure', error: e.message, attempt: attempts, delay: delay)
+          sleep(delay)
+          retry
+        end
+        raise
       end
     end
 
@@ -199,6 +270,14 @@ class LogStash::Outputs::LogstashAzureBlobOutput < LogStash::Outputs::Base
         resource += "\n" + param_str unless param_str.empty?
       end
       resource
+    end
+
+    def retryable_status?(status)
+      RETRYABLE_STATUS.include?(status)
+    end
+
+    def retry_delay(attempt)
+      RETRY_DELAY_SECONDS * attempt
     end
   end
 end

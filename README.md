@@ -36,7 +36,12 @@ output {
 - Optional gzip compression (`compress => true`)
 - Batch control via `events_per_blob`
 - Safer blob naming with timestamp + random suffix
+- Built-in retry + non-fatal error handling (pipeline stays up if Azure rejects uploads)
 - Shared Key request signing (no extra gems required)
+
+## Failure handling
+- HTTP 5xx / 429 / 408 responses and transient connection errors are retried a few times with backoff.
+- Non-retriable errors (for example 403 authorization failures) are logged and the batch is dropped, but the pipeline worker keeps running.
 
 ## Development
 ```
